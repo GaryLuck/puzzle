@@ -122,7 +122,7 @@
   var bestEl = document.getElementById('best');
   var shuffleBtn = document.getElementById('shuffleBtn');
   var solveBtn = document.getElementById('solveBtn');
-  var BEST_KEY = 'fifteen-puzzle-best';
+  var BEST_KEY = 'fifteen-puzzle-best-moves';
   var best = loadBest();
 
   var tiles = [];      // values 1..15, 0 = empty; index = cell 0..15
@@ -278,8 +278,8 @@
 
   function recordWin() {
     var seconds = elapsedSeconds();
-    var score = Math.max(1, 1000 - moves * 10 - seconds);
-    var isBest = !best || score > best.score;
+    var score = moves;
+    var isBest = !best || score < best.score;
     if (isBest) {
       best = { score: score, moves: moves, seconds: seconds };
       try {
@@ -297,7 +297,9 @@
     moves = 0;
     won = false;
     movesEl.textContent = '0';
+    timeEl.textContent = '0:00';
     msgEl.textContent = '';
+    startTimer();
     layout();
   }
 
