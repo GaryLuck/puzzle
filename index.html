@@ -84,6 +84,11 @@
     font-size: 15px;
     cursor: pointer;
   }
+  button.action:disabled,
+  button.secondary:disabled {
+    opacity: 0.55;
+    cursor: wait;
+  }
   #message {
     margin-top: 16px;
     min-height: 24px;
@@ -107,6 +112,7 @@
 <div id="board" role="grid" aria-label="15-puzzle board"></div>
 <div class="controls">
   <button class="action" id="shuffleBtn">Shuffle</button>
+  <button class="secondary" id="stepBtn">Next Step</button>
   <button class="secondary" id="solveBtn">Reset</button>
 </div>
 <div id="message" role="status" aria-live="polite"></div>
@@ -122,6 +128,7 @@
   var bestEl = document.getElementById('best');
   var shuffleBtn = document.getElementById('shuffleBtn');
   var solveBtn = document.getElementById('solveBtn');
+  var stepBtn = document.getElementById('stepBtn');
   var BEST_KEY = 'fifteen-puzzle-best-moves';
   var best = loadBest();
 
@@ -193,6 +200,202 @@
     return out;
   }
 
+  // --- Optimal step-through (IDA* with Manhattan + linear conflict) ---
+  var hintPlan = null;   // remaining tile values of the optimal solution
+  var hintKey = null;    // board fingerprint the plan was computed for
+  var solving = false;
+  var applyingHint = false;
+
+  var GOAL_R = [];
+  var GOAL_C = [];
+  var MANH = [];
+  (function initHeuristicTables() {
+    for (var v = 0; v <= 15; v++) {
+      GOAL_R[v] = v === 0 ? SIZE - 1 : Math.floor((v - 1) / SIZE);
+      GOAL_C[v] = v === 0 ? SIZE - 1 : (v - 1) % SIZE;
+      MANH[v] = [];
+      for (var p = 0; p < 16; p++) {
+        MANH[v][p] = v === 0 ? 0 :
+          Math.abs(GOAL_R[v] - Math.floor(p / SIZE)) + Math.abs(GOAL_C[v] - (p % SIZE));
+      }
+    }
+  })();
+
+  function boardKey(s) {
+    return s.join(',');
+  }
+
+  function clearHint() {
+    hintPlan = null;
+    hintKey = null;
+  }
+
+  // Admissible heuristic: Manhattan distance + 2 per linear conflict.
+  function heuristic(state) {
+    var m = 0;
+    var i, v;
+    for (i = 0; i < 16; i++) {
+      v = state[i];
+      if (v) m += MANH[v][i];
+    }
+    var lc = 0;
+    var r, c1, c2, r1, r2, v1, v2;
+    for (r = 0; r < SIZE; r++) {
+      for (c1 = 0; c1 < SIZE; c1++) {
+        v1 = state[r * SIZE + c1];
+        if (!v1 || GOAL_R[v1] !== r) continue;
+        for (c2 = c1 + 1; c2 < SIZE; c2++) {
+          v2 = state[r * SIZE + c2];
+          if (!v2 || GOAL_R[v2] !== r) continue;
+          if (GOAL_C[v1] > GOAL_C[v2]) lc++;
+        }
+      }
+    }
+    for (c1 = 0; c1 < SIZE; c1++) {
+      for (r1 = 0; r1 < SIZE; r1++) {
+        v1 = state[r1 * SIZE + c1];
+        if (!v1 || GOAL_C[v1] !== c1) continue;
+        for (r2 = r1 + 1; r2 < SIZE; r2++) {
+          v2 = state[r2 * SIZE + c1];
+          if (!v2 || GOAL_C[v2] !== c1) continue;
+          if (GOAL_R[v1] > GOAL_R[v2]) lc++;
+        }
+      }
+    }
+    return m + 2 * lc;
+  }
+
+  function isSolvableState(s) {
+    var inv = 0;
+    var i, j;
+    for (i = 0; i < 16; i++) {
+      if (!s[i]) continue;
+      for (j = i + 1; j < 16; j++) {
+        if (s[j] && s[i] > s[j]) inv++;
+      }
+    }
+    var blankRowFromBottom = SIZE - Math.floor(s.indexOf(0) / SIZE);
+    return (inv + blankRowFromBottom) % 2 === 1;
+  }
+
+  // Depth-first search bounded by f = g + h. Returns -1 when the goal is
+  // reached (path holds the tile values moved), else the next bound.
+  // Child heuristic values are computed once for move ordering and reused.
+  function hintSearch(state, empty, g, bound, prevEmpty, path, h) {
+    if (g + h > bound) return g + h;
+    if (h === 0) return -1;
+    var r = Math.floor(empty / SIZE);
+    var c = empty % SIZE;
+    var nbs = [];
+    if (r > 0 && empty - SIZE !== prevEmpty) nbs.push(empty - SIZE);
+    if (r < SIZE - 1 && empty + SIZE !== prevEmpty) nbs.push(empty + SIZE);
+    if (c > 0 && empty - 1 !== prevEmpty) nbs.push(empty - 1);
+    if (c < SIZE - 1 && empty + 1 !== prevEmpty) nbs.push(empty + 1);
+    var scored = [];
+    var k, nb, tileVal, hh;
+    for (k = 0; k < nbs.length; k++) {
+      nb = nbs[k];
+      tileVal = state[nb];
+      state[empty] = tileVal;
+      state[nb] = 0;
+      hh = heuristic(state);
+      state[nb] = tileVal;
+      state[empty] = 0;
+      scored.push({ nb: nb, val: tileVal, h: hh });
+    }
+    scored.sort(function (a, b) { return a.h - b.h; });
+    var min = Infinity;
+    var s, t;
+    for (s = 0; s < scored.length; s++) {
+      nb = scored[s].nb;
+      tileVal = scored[s].val;
+      state[empty] = tileVal;
+      state[nb] = 0;
+      path.push(tileVal);
+      t = hintSearch(state, nb, g + 1, bound, empty, path, scored[s].h);
+      if (t === -1) return -1;
+      if (t < min) min = t;
+      path.pop();
+      state[nb] = tileVal;
+      state[empty] = 0;
+    }
+    return min;
+  }
+
+  // Returns the optimal list of tile values to move, or null if unsolvable.
+  function computeOptimalPlan(start) {
+    if (!isSolvableState(start)) return null;
+    var state = start.slice();
+    var h = heuristic(state);
+    var bound = h;
+    var path = [];
+    var empty = state.indexOf(0);
+    for (;;) {
+      var t = hintSearch(state, empty, 0, bound, -1, path, h);
+      if (t === -1) return path;
+      if (t === Infinity) return null;
+      bound = t;
+    }
+  }
+
+  function setSolving(on) {
+    solving = on;
+    stepBtn.disabled = on;
+    stepBtn.textContent = on ? 'Solving…' : 'Next Step';
+  }
+
+  function applyHintMove() {
+    var val = hintPlan.shift();
+    applyingHint = true;
+    try {
+      tryMove(val);
+    } finally {
+      applyingHint = false;
+    }
+    // The remaining plan was computed for the board after this move.
+    hintKey = boardKey(tiles);
+    if (!won && hintPlan) {
+      msgEl.textContent = 'Optimal step applied — ' + hintPlan.length +
+        (hintPlan.length === 1 ? ' move to go.' : ' moves to go.');
+    }
+  }
+
+  // Applies one move of an optimal solution. Computes (and caches) the full
+  // optimal plan on first use; later clicks consume the cached plan. Resolves
+  // to true when a move was applied.
+  function stepOptimal() {
+    if (solving) return Promise.resolve(false);
+    if (won || isSolved()) {
+      msgEl.textContent = 'Already solved.';
+      return Promise.resolve(false);
+    }
+    if (hintPlan && hintPlan.length && hintKey === boardKey(tiles)) {
+      applyHintMove();
+      return Promise.resolve(true);
+    }
+    setSolving(true);
+    msgEl.textContent = 'Finding optimal move…';
+    return new Promise(function (resolve) {
+      // Let the status paint before the synchronous search blocks the thread.
+      // Deeply shuffled boards can take a few seconds on the first step;
+      // every later step is instant until the board is changed by hand.
+      setTimeout(function () {
+        var plan = computeOptimalPlan(tiles);
+        setSolving(false);
+        if (!plan || !plan.length) {
+          clearHint();
+          msgEl.textContent = 'No solution found for this board.';
+          resolve(false);
+          return;
+        }
+        hintPlan = plan;
+        hintKey = boardKey(tiles);
+        applyHintMove();
+        resolve(true);
+      }, 30);
+    });
+  }
+
   function shuffle() {
     tiles = solvedState();
     var empty = 15;
@@ -226,6 +429,7 @@
   }
 
   function newGame(shuffled) {
+    clearHint();
     moves = 0;
     won = false;
     movesEl.textContent = '0';
@@ -244,6 +448,8 @@
     if (neighborsOf(empty).indexOf(idx) === -1) return false;
     tiles[empty] = val;
     tiles[idx] = 0;
+    // A manual move leaves the cached optimal plan behind.
+    if (!applyingHint) clearHint();
     moves++;
     movesEl.textContent = String(moves);
     layout();
@@ -293,6 +499,7 @@
 
   // Test helper: place an exact board and reset per-game state.
   function setTiles(state) {
+    clearHint();
     tiles = state.slice();
     moves = 0;
     won = false;
@@ -320,6 +527,7 @@
 
   shuffleBtn.addEventListener('click', function () { newGame(true); });
   solveBtn.addEventListener('click', function () { newGame(false); });
+  stepBtn.addEventListener('click', function () { stepOptimal(); });
   window.addEventListener('resize', layout);
 
   createTiles();
@@ -333,7 +541,11 @@
     isSolved: isSolved,
     setTiles: setTiles,
     getTiles: function () { return tiles.slice(); },
-    getMoves: function () { return moves; }
+    getMoves: function () { return moves; },
+    stepOptimal: stepOptimal,
+    hintRemaining: function () {
+      return (hintPlan && hintKey === boardKey(tiles)) ? hintPlan.length : 0;
+    }
   };
 })();
 </script>
